@@ -530,97 +530,102 @@ class BERTOfTheseus:
     ) -> Tuple[List[float], bool]:
         """
         Perform module replacement training (BERT-of-Theseus).
-        
+
         As per Section 3.2-3.3 and the flowchart (Fig. 6):
         - Freeze Predecessor parameters
         - Train Mix model with module replacement
         - Gradually increase replacement rate
-        - Check convergence: if avg loss delta < threshold over a window → converged
-        
+        - After completing all epochs, check convergence to report Y/N
+
+        IMPORTANT: Training always runs for the full `epochs` (no early stopping).
+        Convergence is evaluated AFTER training completes, matching the flowchart
+        where you first "Train Mix Model" fully, then ask "Model convergence?".
+
         Args:
             train_loader: DataLoader for training data
             epochs: Number of training epochs (default: 250 as per paper)
             learning_rate: Learning rate
             schedule_replacement: Whether to increase replacement rate over time
-            convergence_threshold: Min mean absolute loss change to be considered converged
-            convergence_window: Number of recent epochs used to compute loss delta
-            
+            convergence_threshold: Mean |Δloss| below which model is declared converged
+            convergence_window: Window size of recent epochs to check loss delta
+
         Returns:
             Tuple of (list of training losses, converged flag)
             converged=True  → flowchart branch Y  (proceed to Get best Successor)
             converged=False → flowchart branch N  (loop back to Train Mix Model)
         """
         print("Module replacement training (BERT-of-Theseus)...")
-        
+
         # Freeze Predecessor
         for param in self.predecessor.parameters():
             param.requires_grad = False
-        
+
         # Only train Successor parameters
         optimizer = torch.optim.Adam(
             filter(lambda p: p.requires_grad, self.mix_model.parameters()),
             lr=learning_rate
         )
-        
+
         losses = []
-        converged = False
 
         for epoch in range(epochs):
             # Schedule replacement rate (linear increase)
             if schedule_replacement:
-                current_rate = min(0.9, self.initial_replacement_rate + 
+                current_rate = min(0.9, self.initial_replacement_rate +
                                  (0.9 - self.initial_replacement_rate) * epoch / epochs)
                 self.mix_model.update_replacement_rate(current_rate)
-            
+
             self.mix_model.train()
             epoch_loss = 0.0
-            
+
             for batch_idx, (data, target) in enumerate(train_loader):
                 data, target = data.to(self.device), target.to(self.device)
-                
+
                 optimizer.zero_grad()
-                
+
                 if self.use_optimization:
                     output = self.mix_model(data, target)
                 else:
                     output = self.mix_model(data)
-                
+
                 # Convert target to one-hot for MSE loss (Equation 7)
                 target_onehot = self._to_onehot(target)
                 loss = self.criterion(output, target_onehot)
                 loss.backward()
                 optimizer.step()
-                
+
                 epoch_loss += loss.item()
-            
+
             avg_loss = epoch_loss / len(train_loader)
             losses.append(avg_loss)
-            
+
             if (epoch + 1) % 50 == 0:
                 print(f"  Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}, "
-                      f"Replacement Rate: {current_rate:.2f}" if schedule_replacement 
+                      f"Replacement Rate: {current_rate:.2f}" if schedule_replacement
                       else f"  Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
 
-            # ---------------------------------------------------------------
-            # Model convergence check (Flowchart Fig.6: "Model convergence Y/N")
-            # Check if the loss has stopped decreasing over the last window epochs.
-            # If |Δloss| < threshold for all steps in the window → model converged (Y)
-            # ---------------------------------------------------------------
-            if len(losses) >= convergence_window:
-                recent = losses[-convergence_window:]
-                loss_deltas = [abs(recent[i] - recent[i - 1])
-                               for i in range(1, len(recent))]
-                mean_delta = sum(loss_deltas) / len(loss_deltas)
+        # ---------------------------------------------------------------
+        # Model convergence check (Flowchart Fig.6: "Model convergence Y/N")
+        # Evaluated AFTER completing all training epochs (not during).
+        # Checks if the loss stabilised in the final window of epochs.
+        # ---------------------------------------------------------------
+        converged = False
+        if len(losses) >= convergence_window:
+            recent = losses[-convergence_window:]
+            loss_deltas = [abs(recent[i] - recent[i - 1])
+                           for i in range(1, len(recent))]
+            mean_delta = sum(loss_deltas) / len(loss_deltas)
 
-                if mean_delta < convergence_threshold:
-                    print(f"  [Convergence Y] Model converged at epoch {epoch + 1} "
-                          f"(mean |Δloss| = {mean_delta:.6f} < {convergence_threshold})")
-                    converged = True
-                    break   # ← branch Y: exit training loop
-
-        if not converged:
-            print(f"  [Convergence N] Model did not converge within {epochs} epochs. "
-                  f"Will loop back to Train Mix Model if rounds remain.")
+            if mean_delta < convergence_threshold:
+                print(f"  [Convergence Y] Model converged after {epochs} epochs "
+                      f"(mean |Δloss| = {mean_delta:.6f} < {convergence_threshold})")
+                converged = True
+            else:
+                print(f"  [Convergence N] Loss still changing after {epochs} epochs "
+                      f"(mean |Δloss| = {mean_delta:.6f} >= {convergence_threshold})")
+        else:
+            print(f"  [Convergence Y] Completed {epochs} epochs (window too small to check).")
+            converged = True
 
         return losses, converged
     
