@@ -112,12 +112,12 @@ class TrainingConfig:
     use_gradient_optimization: bool = True
 
     # Imbalance handling
-    use_weighted_sampler: bool = True
+    use_weighted_sampler: bool = False
     weighted_sampler_power: float = 1.0
 
     # Convergence loop (Flowchart Fig.6: "Model convergence Y/N")
-    max_replacement_rounds: int = 1       # 1 = run exactly once (safe default); increase only if needed
-    convergence_threshold: float = 1e-6   # mean |Δloss| < this → converged (Y); very small = almost never re-loops
+    max_replacement_rounds: int = 3       # max times to re-run Train Mix Model
+    convergence_threshold: float = 1e-4   # |mean Δloss| < this → converged (Y)
     convergence_window: int = 10          # window size for convergence check
 
 

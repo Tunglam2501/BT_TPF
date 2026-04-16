@@ -115,13 +115,18 @@ class OptimizedMixModule(nn.Module):
         self,
         predecessor_module: nn.Module,
         successor_module: nn.Module,
-        base_replacement_rate: float = 0.5
+        base_replacement_rate: float = 0.5,
+        pool_layer: Optional[nn.Module] = None,
+        classifier_layer: Optional[nn.Module] = None
     ):
         super(OptimizedMixModule, self).__init__()
         
         self.predecessor_module = predecessor_module
         self.successor_module = successor_module
         self.base_replacement_rate = base_replacement_rate
+        
+        self.pool_layer = pool_layer
+        self.classifier_layer = classifier_layer
         
         # Cache for gradient optimization
         self.predecessor_output = None
@@ -160,31 +165,40 @@ class OptimizedMixModule(nn.Module):
         Returns:
             Optimal replacement rate
         """
-        # FIX: Reduce 3D tensors to 1D (per-sample scalar) using Global Average Pooling
-        # scc_output shape: [Batch, Seq_len, Embed_dim] -> [Batch]
-        # prd_output shape: [Batch, Seq_len, Embed_dim] -> [Batch]
-        if scc_output.dim() == 3:
-            scc_mean = scc_output.mean(dim=(1, 2))  # [Batch]
-            prd_mean = prd_output.mean(dim=(1, 2))  # [Batch]
-        elif scc_output.dim() == 2:
-            scc_mean = scc_output.mean(dim=1)  # [Batch]
-            prd_mean = prd_output.mean(dim=1)  # [Batch]
-        else:
-            scc_mean = scc_output.flatten()
-            prd_mean = prd_output.flatten()
+        # FIX: Instead of averaging the embedding and comparing to a class index label,
+        # we must project the 3D embedding pseudo-outputs to the [Batch, NumClasses] 
+        # classification space using the Successor's pretrained pool and classifier layers!
+        # This makes it mathematically sound to compare them against the one-hot target matrix.
         
-        # y_label is [Batch] containing class indices
+        # 1. Project SCC to logits
+        if scc_output.dim() == 3 and self.pool_layer is not None and self.classifier_layer is not None:
+            # x is [B, Seq, Embed] -> transpose to [B, Embed, Seq] for Conv1D/Pool1D
+            scc_pooled = self.pool_layer(scc_output.transpose(1, 2)).squeeze(-1) # [B, Embed]
+            scc_logits = self.classifier_layer(scc_pooled) # [B, NumClasses]
+        else:
+            scc_logits = scc_output.mean(dim=(1, 2)) if scc_output.dim() == 3 else scc_output
+            scc_logits = scc_logits.flatten()
+
+        # 2. Project PRD to logits
+        if prd_output.dim() == 3 and self.pool_layer is not None and self.classifier_layer is not None:
+            prd_pooled = self.pool_layer(prd_output.transpose(1, 2)).squeeze(-1)
+            prd_logits = self.classifier_layer(prd_pooled)
+        else:
+            prd_logits = prd_output.mean(dim=(1, 2)) if prd_output.dim() == 3 else prd_output
+            prd_logits = prd_logits.flatten()
+        
+        # y_label is the one-hot matrix [Batch, NumClasses]
         y = y_label.float()
         
-        # Now all tensors are 1D [Batch], can perform element-wise operations
+        # Now all tensors are [Batch, NumClasses]. We can safely perform element-wise gradient analysis!
         # Compute |scc_i(y_i) - y_label|
-        scc_minus_label = (scc_mean - y).abs().mean().item()
+        scc_minus_label = (scc_logits - y).abs().mean().item()
         
         # Compute coefficients for quadratic equation
         # a = (scc - prd)
         # b = (prd - 2*scc + y_label)
-        a = (scc_mean - prd_mean).mean().item()
-        b = (prd_mean - 2 * scc_mean + y).mean().item()
+        a = (scc_logits - prd_logits).mean().item()
+        b = (prd_logits - 2 * scc_logits + y).mean().item()
         
         # Avoid division by zero
         if abs(a) < 1e-8:
@@ -293,7 +307,9 @@ class MixModel(nn.Module):
                 OptimizedMixModule(
                     predecessor.get_module(i),
                     successor.get_module(i),
-                    replacement_rate
+                    replacement_rate,
+                    successor.pool,
+                    successor.classifier
                 )
                 for i in range(self.num_modules)
             ])
@@ -567,6 +583,7 @@ class BERTOfTheseus:
         )
 
         losses = []
+        converged = False
 
         for epoch in range(epochs):
             # Schedule replacement rate (linear increase)
@@ -583,13 +600,14 @@ class BERTOfTheseus:
 
                 optimizer.zero_grad()
 
+                # Convert target to one-hot for MSE loss and gradient optimization!
+                target_onehot = self._to_onehot(target)
+
                 if self.use_optimization:
-                    output = self.mix_model(data, target)
+                    output = self.mix_model(data, target_onehot)
                 else:
                     output = self.mix_model(data)
 
-                # Convert target to one-hot for MSE loss (Equation 7)
-                target_onehot = self._to_onehot(target)
                 loss = self.criterion(output, target_onehot)
                 loss.backward()
                 optimizer.step()
@@ -604,28 +622,25 @@ class BERTOfTheseus:
                       f"Replacement Rate: {current_rate:.2f}" if schedule_replacement
                       else f"  Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
 
-        # ---------------------------------------------------------------
-        # Model convergence check (Flowchart Fig.6: "Model convergence Y/N")
-        # Evaluated AFTER completing all training epochs (not during).
-        # Checks if the loss stabilised in the final window of epochs.
-        # ---------------------------------------------------------------
-        converged = False
-        if len(losses) >= convergence_window:
-            recent = losses[-convergence_window:]
-            loss_deltas = [abs(recent[i] - recent[i - 1])
-                           for i in range(1, len(recent))]
-            mean_delta = sum(loss_deltas) / len(loss_deltas)
+            # ---------------------------------------------------------------
+            # Model convergence check (Flowchart Fig.6: "Model convergence Y/N")
+            # Evaluated during training epochs to enable early exit.
+            # ---------------------------------------------------------------
+            if len(losses) >= convergence_window:
+                recent = losses[-convergence_window:]
+                loss_deltas = [abs(recent[i] - recent[i - 1])
+                               for i in range(1, len(recent))]
+                mean_delta = sum(loss_deltas) / len(loss_deltas)
 
-            if mean_delta < convergence_threshold:
-                print(f"  [Convergence Y] Model converged after {epochs} epochs "
-                      f"(mean |Δloss| = {mean_delta:.6f} < {convergence_threshold})")
-                converged = True
-            else:
-                print(f"  [Convergence N] Loss still changing after {epochs} epochs "
-                      f"(mean |Δloss| = {mean_delta:.6f} >= {convergence_threshold})")
-        else:
-            print(f"  [Convergence Y] Completed {epochs} epochs (window too small to check).")
-            converged = True
+                if mean_delta < convergence_threshold:
+                    print(f"  [Convergence Y] Model converged at epoch {epoch + 1} "
+                          f"(mean |Δloss| = {mean_delta:.6f} < {convergence_threshold})")
+                    converged = True
+                    break
+
+        if not converged:
+            print(f"  [Convergence N] Model did not converge within {epochs} epochs. "
+                  f"Will loop back to Train Mix Model if rounds remain.")
 
         return losses, converged
     
