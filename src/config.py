@@ -112,8 +112,8 @@ class TrainingConfig:
     use_gradient_optimization: bool = True
 
     # Imbalance handling
-    use_weighted_sampler: bool = False
-    weighted_sampler_power: float = 1.0
+    use_weighted_sampler: bool = True
+    weighted_sampler_power: float = 0.5
 
     # Convergence loop (Flowchart Fig.6: "Model convergence Y/N")
     max_replacement_rounds: int = 3       # max times to re-run Train Mix Model
